@@ -1,5 +1,5 @@
 use std::sync::atomic::AtomicBool;
-use std::sync::RwLock;
+use std::sync::{Once, RwLock};
 use std::thread::{self, Builder};
 
 use big_s::S;
@@ -10,6 +10,7 @@ use hashbrown::HashMap;
 use heed::RwTxn;
 pub use partial_dump::PartialDump;
 pub use update_by_function::UpdateByFunction;
+pub use write::ChannelCongestion;
 use write::{build_vectors, update_index, write_to_db};
 
 use super::channel::*;
@@ -33,6 +34,8 @@ mod post_processing;
 mod update_by_function;
 mod write;
 
+static LOG_MEMORY_METRICS_ONCE: Once = Once::new();
+
 /// This is the main function of this crate.
 ///
 /// Give it the output of the [`Indexer::document_changes`] method and it will execute it in the [`rayon::ThreadPool`].
@@ -51,7 +54,7 @@ pub fn index<'pl, 'indexer, 'index, DC, MSP>(
     embedders: EmbeddingConfigs,
     must_stop_processing: &'indexer MSP,
     progress: &'indexer Progress,
-) -> Result<()>
+) -> Result<ChannelCongestion>
 where
     DC: DocumentChanges<'pl>,
     MSP: Fn() -> bool + Sync,
@@ -93,6 +96,15 @@ where
         },
     );
 
+    LOG_MEMORY_METRICS_ONCE.call_once(|| {
+        tracing::debug!(
+            "Indexation allocated memory metrics - \
+            Total BBQueue size: {total_bbbuffer_capacity}, \
+            Total extractor memory: {:?}",
+            grenad_parameters.max_memory,
+        );
+    });
+
     let (extractor_sender, writer_receiver) = pool
         .install(|| extractor_writer_bbqueue(&mut bbbuffers, total_bbbuffer_capacity, 1000))
         .unwrap();
@@ -118,14 +130,16 @@ where
     let index_embeddings = index.embedding_configs(wtxn)?;
     let mut field_distribution = index.field_distribution(wtxn)?;
     let mut document_ids = index.documents_ids(wtxn)?;
+    let mut modified_docids = roaring::RoaringBitmap::new();
 
-    thread::scope(|s| -> Result<()> {
+    let congestion = thread::scope(|s| -> Result<ChannelCongestion> {
         let indexer_span = tracing::Span::current();
         let embedders = &embedders;
         let finished_extraction = &finished_extraction;
         // prevent moving the field_distribution and document_ids in the inner closure...
         let field_distribution = &mut field_distribution;
         let document_ids = &mut document_ids;
+        let modified_docids = &mut modified_docids;
         let extractor_handle =
             Builder::new().name(S("indexer-extractors")).spawn_scoped(s, move || {
                 pool.install(move || {
@@ -140,6 +154,7 @@ where
                         field_distribution,
                         index_embeddings,
                         document_ids,
+                        modified_docids,
                     )
                 })
                 .unwrap()
@@ -171,7 +186,8 @@ where
 
         let mut arroy_writers = arroy_writers?;
 
-        write_to_db(writer_receiver, finished_extraction, index, wtxn, &arroy_writers)?;
+        let congestion =
+            write_to_db(writer_receiver, finished_extraction, index, wtxn, &arroy_writers)?;
 
         indexing_context.progress.update_progress(IndexingStep::WaitingForExtractors);
 
@@ -179,13 +195,16 @@ where
 
         indexing_context.progress.update_progress(IndexingStep::WritingEmbeddingsToDatabase);
 
-        build_vectors(
-            index,
-            wtxn,
-            index_embeddings,
-            &mut arroy_writers,
-            &indexing_context.must_stop_processing,
-        )?;
+        pool.install(|| {
+            build_vectors(
+                index,
+                wtxn,
+                index_embeddings,
+                &mut arroy_writers,
+                &indexing_context.must_stop_processing,
+            )
+        })
+        .unwrap()?;
 
         post_processing::post_process(
             indexing_context,
@@ -196,7 +215,7 @@ where
 
         indexing_context.progress.update_progress(IndexingStep::Finalizing);
 
-        Ok(()) as Result<_>
+        Ok(congestion) as Result<_>
     })?;
 
     // required to into_inner the new_fields_ids_map
@@ -211,7 +230,8 @@ where
         embedders,
         field_distribution,
         document_ids,
+        modified_docids,
     )?;
 
-    Ok(())
+    Ok(congestion)
 }

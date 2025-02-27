@@ -14,13 +14,13 @@ use crate::update::settings::InnerIndexSettings;
 use crate::vector::{ArroyWrapper, Embedder, EmbeddingConfigs, Embeddings};
 use crate::{Error, Index, InternalError, Result};
 
-pub(super) fn write_to_db(
+pub fn write_to_db(
     mut writer_receiver: WriterBbqueueReceiver<'_>,
     finished_extraction: &AtomicBool,
     index: &Index,
     wtxn: &mut RwTxn<'_>,
     arroy_writers: &HashMap<u8, (&str, &Embedder, ArroyWrapper, usize)>,
-) -> Result<()> {
+) -> Result<ChannelCongestion> {
     // Used by by the ArroySetVector to copy the embedding into an
     // aligned memory area, required by arroy to accept a new vector.
     let mut aligned_embedding = Vec::new();
@@ -72,12 +72,32 @@ pub(super) fn write_to_db(
             &mut aligned_embedding,
         )?;
     }
+
     write_from_bbqueue(&mut writer_receiver, index, wtxn, arroy_writers, &mut aligned_embedding)?;
-    Ok(())
+
+    Ok(ChannelCongestion {
+        attempts: writer_receiver.sent_messages_attempts(),
+        blocking_attempts: writer_receiver.blocking_sent_messages_attempts(),
+    })
 }
 
-#[tracing::instrument(level = "trace", skip_all, target = "indexing::vectors")]
-pub(super) fn build_vectors<MSP>(
+/// Stats exposing the congestion of a channel.
+#[derive(Debug, Copy, Clone)]
+pub struct ChannelCongestion {
+    /// Number of attempts to send a message into the bbqueue buffer.
+    pub attempts: usize,
+    /// Number of blocking attempts which require a retry.
+    pub blocking_attempts: usize,
+}
+
+impl ChannelCongestion {
+    pub fn congestion_ratio(&self) -> f32 {
+        self.blocking_attempts as f32 / self.attempts as f32
+    }
+}
+
+#[tracing::instrument(level = "debug", skip_all, target = "indexing::vectors")]
+pub fn build_vectors<MSP>(
     index: &Index,
     wtxn: &mut RwTxn<'_>,
     index_embeddings: Vec<IndexEmbeddingConfig>,
@@ -101,6 +121,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn update_index(
     index: &Index,
     wtxn: &mut RwTxn<'_>,
@@ -109,6 +130,7 @@ pub(super) fn update_index(
     embedders: EmbeddingConfigs,
     field_distribution: std::collections::BTreeMap<String, u64>,
     document_ids: roaring::RoaringBitmap,
+    modified_docids: roaring::RoaringBitmap,
 ) -> Result<()> {
     index.put_fields_ids_map(wtxn, new_fields_ids_map.as_fields_ids_map())?;
     if let Some(new_primary_key) = new_primary_key {
@@ -120,6 +142,7 @@ pub(super) fn update_index(
     index.put_field_distribution(wtxn, &field_distribution)?;
     index.put_documents_ids(wtxn, &document_ids)?;
     index.set_updated_at(wtxn, &OffsetDateTime::now_utc())?;
+    index.update_documents_stats(wtxn, modified_docids)?;
     Ok(())
 }
 

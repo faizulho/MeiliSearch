@@ -10,6 +10,7 @@ pub mod documents;
 
 mod asc_desc;
 mod criterion;
+pub mod database_stats;
 mod error;
 mod external_documents_ids;
 pub mod facet;
@@ -73,6 +74,7 @@ pub use self::search::{
     FacetDistribution, Filter, FormatOptions, MatchBounds, MatcherBuilder, MatchingWords, OrderBy,
     Search, SearchResult, SemanticSearch, TermsMatchingStrategy, DEFAULT_VALUES_PER_FACET,
 };
+pub use self::update::ChannelCongestion;
 
 pub type Result<T> = std::result::Result<T, error::Error>;
 
